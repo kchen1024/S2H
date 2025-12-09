@@ -1,0 +1,6 @@
+# ninja log v7
+1	6116	1763090536268370060	/home/sas/ke/AdaInt/adaint/ailut_transform/build/temp.linux-x86_64-cpython-37/ailut/csrc/ailut_transform_cpu.o	32375d9916ea419e
+0	6778	1763090536267370060	/home/sas/ke/AdaInt/adaint/ailut_transform/build/temp.linux-x86_64-cpython-37/ailut/csrc/ailut_transform.o	70b07780a7c209c8
+3	6356	1763090738120592235	/home/sas/ke/AdaInt/adaint/ailut_transform/build/temp.linux-x86_64-cpython-37/ailut/csrc/ailut_transform_cpu.o	a4a95fa3a62e02e7
+3	7016	1763090738119358664	/home/sas/ke/AdaInt/adaint/ailut_transform/build/temp.linux-x86_64-cpython-37/ailut/csrc/ailut_transform.o	b5598c1b268e1784
+4	14470	1763090738121203496	/home/sas/ke/AdaInt/adaint/ailut_transform/build/temp.linux-x86_64-cpython-37/ailut/csrc/ailut_transform_cuda.o	ea07a4273c7d446
