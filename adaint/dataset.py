@@ -92,21 +92,25 @@ class BaseEnhanceDataset(BaseDataset):
                 f'Length of evaluation result of {metric} is {len(val_list)}, '
                 f'should be {len(self)}')
 
-        # average the results
-        eval_result = {
-            metric: sum(values) / len(self)
-            for metric, values in eval_result.items()
-        }
+        # average the results, filtering out inf values
+        final_result = {}
+        for metric, values in eval_result.items():
+            # Filter out inf values for averaging
+            finite_values = [v for v in values if v != float('inf')]
+            if finite_values:
+                final_result[metric] = sum(finite_values) / len(finite_values)
+            else:
+                final_result[metric] = float('inf')
 
-        return eval_result
+        return final_result
     
 
-@DATASETS.register_module()
+@DATASETS.register_module(force=True)
 class FiveK(BaseEnhanceDataset):
     pass
 
 
-@DATASETS.register_module()
+@DATASETS.register_module(force=True)
 class PPR10K(BaseEnhanceDataset):
     r"""PPR10K dataset for image enhancement.
 
@@ -135,7 +139,7 @@ class PPR10K(BaseEnhanceDataset):
         return data_infos
 
 
-@DATASETS.register_module()
+@DATASETS.register_module(force=True)
 class HDRTV1K(BaseEnhanceDataset):
     def load_annotations(self):
         r"""Load annoations for enhancement dataset.

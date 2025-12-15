@@ -12,6 +12,8 @@ from mmcv.runner import auto_fp16
 from mmedit.models.base import BaseModel
 from mmedit.models.registry import MODELS
 from mmedit.models.builder import build_loss
+# Import losses to ensure they are registered before build_loss is called
+from mmedit.models import losses  # noqa: F401
 from mmedit.core import psnr, ssim, tensor2img
 from mmedit.utils import get_root_logger
 import numpy as np
@@ -197,7 +199,7 @@ class AdaInt(nn.Module):
         return vertices
 
 
-@MODELS.register_module()
+@MODELS.register_module(force=True)
 class AiLUT(BaseModel):
     r"""Adaptive-Interval 3D Lookup Table for real-time image enhancement.
 
@@ -220,7 +222,18 @@ class AiLUT(BaseModel):
             Default: 0.
         monotonicity_factor (float, optional): Loss weight for the monotonicaity
             regularization term. Default: 10.0.
+        edge_aware_weight (float, optional): Weight for edge-aware reconstruction loss.
+            When > 0, edges detected using Sobel operators will be weighted more heavily
+            in the reconstruction loss. Default: 0.0.
         recons_loss (dict, optional): Config for pixel-wise reconstruction loss.
+        perceptual_loss (dict, optional): Config for perceptual loss. If None, perceptual
+            loss will not be used. Default: None.
+        gradient_loss (dict, optional): Config for gradient loss. If None, gradient
+            loss will not be used. Default: None.
+        gamut_loss (dict, optional): Config for color gamut loss. If None, gamut
+            loss will not be used. Default: None.
+        hdr_tone_loss (dict, optional): Config for HDR tone mapping loss. If None, HDR
+            tone loss will not be used. Default: None.
         train_cfg (dict, optional): Config for training. Default: None.
         test_cfg (dict, optional): Config for testing. Default: None.
     """
@@ -238,7 +251,12 @@ class AiLUT(BaseModel):
         sparse_factor=0.0001,
         smooth_factor=0,
         monotonicity_factor=10.0,
-        recons_loss=dict(type='L2Loss', loss_weight=1.0, reduction='mean'),
+        edge_aware_weight=0.0,
+        recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'),
+        perceptual_loss=None,
+        gradient_loss=None,
+        gamut_loss=None,
+        hdr_tone_loss=None,
         train_cfg=None,
         test_cfg=None):
 
@@ -271,6 +289,7 @@ class AiLUT(BaseModel):
         self.sparse_factor = sparse_factor
         self.smooth_factor = smooth_factor
         self.monotonicity_factor = monotonicity_factor
+        self.edge_aware_weight = edge_aware_weight
         self.backbone_name = backbone.lower()
 
         self.train_cfg = train_cfg
@@ -281,6 +300,12 @@ class AiLUT(BaseModel):
         self.init_weights()
 
         self.recons_loss = build_loss(recons_loss)
+
+        # Build new loss modules
+        self.perceptual_loss = build_loss(perceptual_loss) if perceptual_loss else None
+        self.gradient_loss = build_loss(gradient_loss) if gradient_loss else None
+        self.gamut_loss = build_loss(gamut_loss) if gamut_loss else None
+        self.hdr_tone_loss = build_loss(hdr_tone_loss) if hdr_tone_loss else None
 
         # fix AdaInt for some steps
         self.n_fix_iters = train_cfg.get('n_fix_iters', 0) if train_cfg else 0
@@ -331,6 +356,48 @@ class AiLUT(BaseModel):
 
         return outs, weights, vertices
 
+    def _compute_edge_weight(self, img):
+        r"""Compute edge weight map using Sobel operators.
+
+        Args:
+            img (Tensor): Input image, shape (b, c, h, w).
+
+        Returns:
+            Tensor: Edge weight map, shape (b, 1, h, w).
+        """
+        # Sobel kernels
+        kx = torch.Tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]]).view(1, 1, 3, 3).to(img)
+        ky = torch.Tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]).view(1, 1, 3, 3).to(img)
+
+        # Convert to grayscale for edge detection
+        gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+
+        # Compute gradients
+        grad_x = F.conv2d(gray, kx, padding=1)
+        grad_y = F.conv2d(gray, ky, padding=1)
+        edge_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+
+        # Normalize and create weight map
+        edge_weight = 1.0 + self.edge_aware_weight * edge_magnitude
+        edge_weight = edge_weight / edge_weight.mean()  # Normalize to maintain scale
+
+        return edge_weight
+
+    def _weighted_recons_loss(self, pred, target, weight):
+        r"""Compute weighted reconstruction loss.
+
+        Args:
+            pred (Tensor): Predicted image, shape (b, c, h, w).
+            target (Tensor): Ground truth image, shape (b, c, h, w).
+            weight (Tensor): Weight map, shape (b, 1, h, w).
+
+        Returns:
+            Tensor: Weighted reconstruction loss.
+        """
+        loss = (pred - target) ** 2
+        weighted_loss = loss * weight
+        return weighted_loss.mean()
+
     @auto_fp16(apply_to=('lq', ))
     def forward(self, lq, gt=None, test_mode=False, **kwargs):
         r"""Forward function.
@@ -358,7 +425,35 @@ class AiLUT(BaseModel):
         """
         losses = dict()
         output, weights, vertices = self.forward_dummy(lq)
-        losses['loss_recons'] = self.recons_loss(output, gt)
+
+        # Reconstruction loss (with optional edge weighting)
+        if self.edge_aware_weight > 0:
+            edge_weight = self._compute_edge_weight(gt)
+            losses['loss_recons'] = self._weighted_recons_loss(output, gt, edge_weight)
+        else:
+            losses['loss_recons'] = self.recons_loss(output, gt)
+
+        # Perceptual loss
+        if self.perceptual_loss is not None:
+            loss_percep, loss_style = self.perceptual_loss(output, gt)
+            if loss_percep is not None:
+                losses['loss_perceptual'] = loss_percep
+            if loss_style is not None:
+                losses['loss_style'] = loss_style
+
+        # Gradient loss
+        if self.gradient_loss is not None:
+            losses['loss_gradient'] = self.gradient_loss(output, gt)
+
+        # Color gamut loss
+        if self.gamut_loss is not None:
+            losses['loss_gamut'] = self.gamut_loss(output, gt)
+
+        # HDR tone mapping loss
+        if self.hdr_tone_loss is not None:
+            losses['loss_hdr_tone'] = self.hdr_tone_loss(output, gt)
+
+        # Existing regularization losses
         if self.sparse_factor > 0:
             losses['loss_sparse'] = self.sparse_factor * torch.mean(weights.pow(2))
         reg_smoothness, reg_monotonicity = self.lut_generator.regularizations(
@@ -367,6 +462,7 @@ class AiLUT(BaseModel):
             losses['loss_smooth'] = reg_smoothness
         if self.monotonicity_factor > 0:
             losses['loss_mono'] = reg_monotonicity
+
         outputs = dict(
             losses=losses,
             num_samples=len(gt.data),
@@ -475,8 +571,9 @@ class AiLUT(BaseModel):
         """
         crop_border = self.test_cfg.crop_border
 
-        output = tensor2img(output)
-        gt = tensor2img(gt)
+        # Use uint16 for HDR data to preserve more precision (0-65535 range)
+        output = tensor2img(output, out_type=np.uint16, min_max=(0, 1))
+        gt = tensor2img(gt, out_type=np.uint16, min_max=(0, 1))
 
         eval_result = dict()
         for metric in self.test_cfg.metrics:

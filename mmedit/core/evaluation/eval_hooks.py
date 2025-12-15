@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os.path as osp
 
+import torch
 from mmcv.runner import Hook
 from torch.utils.data import DataLoader
 
@@ -17,6 +18,7 @@ class EvalIterHook(Hook):
         eval_kwargs (dict): Other eval kwargs. It contains:
             save_image (bool): Whether to save image.
             save_path (str): The path to save image.
+            save_best (str): Metric name to save best checkpoint. Default: None.
     """
 
     def __init__(self, dataloader, interval=1, **eval_kwargs):
@@ -28,6 +30,8 @@ class EvalIterHook(Hook):
         self.eval_kwargs = eval_kwargs
         self.save_image = self.eval_kwargs.pop('save_image', False)
         self.save_path = self.eval_kwargs.pop('save_path', None)
+        self.save_best = self.eval_kwargs.pop('save_best', None)
+        self.best_score = None
 
     def after_train_iter(self, runner):
         """The behavior after each train iteration.
@@ -60,6 +64,23 @@ class EvalIterHook(Hook):
             runner.log_buffer.output[name] = val
         runner.log_buffer.ready = True
 
+        # Save best checkpoint
+        if self.save_best and self.save_best in eval_res:
+            current_score = eval_res[self.save_best]
+            if self.best_score is None or current_score > self.best_score:
+                self.best_score = current_score
+                best_ckpt_path = osp.join(
+                    runner.work_dir, f'best_{self.save_best}_iter_{runner.iter}.pth')
+                runner.logger.info(
+                    f'Saving best checkpoint with {self.save_best}={current_score:.4f}')
+                torch.save(runner.model.state_dict(), best_ckpt_path)
+                # Also save a symlink/copy as best.pth for easy access
+                best_link = osp.join(runner.work_dir, f'best_{self.save_best}.pth')
+                if osp.exists(best_link):
+                    import os
+                    os.remove(best_link)
+                torch.save(runner.model.state_dict(), best_link)
+
 
 class DistEvalIterHook(EvalIterHook):
     """Distributed evaluation hook.
@@ -74,6 +95,7 @@ class DistEvalIterHook(EvalIterHook):
         eval_kwargs (dict): Other eval kwargs. It may contain:
             save_image (bool): Whether save image.
             save_path (str): The path to save image.
+            save_best (str): Metric name to save best checkpoint. Default: None.
     """
 
     def __init__(self,

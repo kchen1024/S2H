@@ -172,8 +172,8 @@ def psnr(img1, img2, crop_border=0, input_order='HWC', convert_to=None):
     Ref: https://en.wikipedia.org/wiki/Peak_signal-to-noise_ratio
 
     Args:
-        img1 (ndarray): Images with range [0, 255].
-        img2 (ndarray): Images with range [0, 255].
+        img1 (ndarray): Images with range [0, 255] for uint8 or [0, 65535] for uint16.
+        img2 (ndarray): Images with range [0, 255] for uint8 or [0, 65535] for uint16.
         crop_border (int): Cropped pixels in each edges of an image. These
             pixels are not involved in the PSNR calculation. Default: 0.
         input_order (str): Whether the input order is 'HWC' or 'CHW'.
@@ -193,13 +193,20 @@ def psnr(img1, img2, crop_border=0, input_order='HWC', convert_to=None):
         raise ValueError(
             f'Wrong input_order {input_order}. Supported input_orders are '
             '"HWC" and "CHW"')
+
+    # Determine max value based on dtype (must check before any conversion)
+    if img1.dtype == np.uint16:
+        max_val = 65535.
+    else:
+        max_val = 255.
+
     img1 = reorder_image(img1, input_order=input_order)
     img2 = reorder_image(img2, input_order=input_order)
 
-    img1, img2 = img1.astype(np.float32), img2.astype(np.float32)
+    img1, img2 = img1.astype(np.float64), img2.astype(np.float64)
     if isinstance(convert_to, str) and convert_to.lower() == 'y':
-        img1 = mmcv.bgr2ycbcr(img1 / 255., y_only=True) * 255.
-        img2 = mmcv.bgr2ycbcr(img2 / 255., y_only=True) * 255.
+        img1 = mmcv.bgr2ycbcr(img1 / max_val, y_only=True) * max_val
+        img2 = mmcv.bgr2ycbcr(img2 / max_val, y_only=True) * max_val
     elif convert_to is not None:
         raise ValueError('Wrong color model. Supported values are '
                          '"Y" and None.')
@@ -211,7 +218,7 @@ def psnr(img1, img2, crop_border=0, input_order='HWC', convert_to=None):
     mse_value = np.mean((img1 - img2)**2)
     if mse_value == 0:
         return float('inf')
-    return 20. * np.log10(255. / np.sqrt(mse_value))
+    return 20. * np.log10(max_val / np.sqrt(mse_value))
 
 
 def _ssim(img1, img2):

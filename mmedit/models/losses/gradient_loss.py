@@ -35,15 +35,20 @@ class GradientLoss(nn.Module):
             weight (Tensor, optional): of shape (N, C, H, W). Element-wise
                 weights. Default: None.
         """
+        c = pred.shape[1]
         kx = torch.Tensor([[1, 0, -1], [2, 0, -2],
                            [1, 0, -1]]).view(1, 1, 3, 3).to(target)
         ky = torch.Tensor([[1, 2, 1], [0, 0, 0],
                            [-1, -2, -1]]).view(1, 1, 3, 3).to(target)
 
-        pred_grad_x = F.conv2d(pred, kx, padding=1)
-        pred_grad_y = F.conv2d(pred, ky, padding=1)
-        target_grad_x = F.conv2d(target, kx, padding=1)
-        target_grad_y = F.conv2d(target, ky, padding=1)
+        # Repeat kernels for each channel (groups convolution)
+        kx = kx.repeat(c, 1, 1, 1)
+        ky = ky.repeat(c, 1, 1, 1)
+
+        pred_grad_x = F.conv2d(pred, kx, padding=1, groups=c)
+        pred_grad_y = F.conv2d(pred, ky, padding=1, groups=c)
+        target_grad_x = F.conv2d(target, kx, padding=1, groups=c)
+        target_grad_y = F.conv2d(target, ky, padding=1, groups=c)
 
         loss = (
             l1_loss(

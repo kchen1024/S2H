@@ -59,6 +59,12 @@ def main():
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
+
+    # Handle custom_imports to register custom modules
+    if hasattr(cfg, 'custom_imports'):
+        import importlib
+        for module_name in cfg.custom_imports.get('imports', []):
+            importlib.import_module(module_name)
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True

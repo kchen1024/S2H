@@ -14,10 +14,51 @@ model = dict(
     backbone='res18', # 'tpami'
     pretrained=True,
     n_colors=3,
+
+    # Reconstruction loss
+    recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'),
+
+    # Perceptual loss for better visual quality and smoother transitions
+    #perceptual_loss=dict(
+    #    type='PerceptualLoss',
+    #    layer_weights={'4': 1.0, '9': 1.0, '18': 1.0},
+    #    vgg_type='vgg19',
+    #    use_input_norm=True,
+    #    perceptual_weight=0.1,
+    #    style_weight=0.0,
+    #    norm_img=False,
+    #    criterion='l1'
+    #),
+
+    # Gradient loss for smoother color transitions
+    gradient_loss=dict(
+        type='GradientLoss',
+        loss_weight=0.1
+    ),
+
+    # Color gamut loss to expand HDR color range
+    gamut_loss=dict(
+        type='ColorGamutLoss',
+        loss_weight=0.05,
+        num_bins=64,
+        color_space='rgb'
+    ),
+
+    # HDR tone mapping loss to preserve HDR characteristics
+    hdr_tone_loss=dict(
+        type='HDRToneLoss',
+        loss_weight=0.2,
+        epsilon=1e-6
+    ),
+
+    # Edge-aware weighting to reduce blocky artifacts
+    edge_aware_weight=0.1,
+
+    # Regularization factors
     sparse_factor=0.0001,
-    smooth_factor=0,
-    monotonicity_factor=10.0,
-    recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'))
+    smooth_factor=0.2,  # Enabled for LUT smoothness
+    monotonicity_factor=10.0
+)
 # model training and testing settings
 train_cfg = dict(n_fix_iters=3329*5)
 test_cfg = dict(metrics=['PSNR'], crop_border=0)
@@ -138,6 +179,6 @@ dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = f'./work_dirs/{exp_name}'
 load_from = None
-resume_from = './work_dirs/ailut_hdrtv/iter_359532.pth'
+resume_from = None
 workflow = [('train', 1)]
 find_unused_parameters = True
