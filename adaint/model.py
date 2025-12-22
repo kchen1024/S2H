@@ -197,6 +197,93 @@ class AdaInt(nn.Module):
         return vertices
 
 
+class SpatialRefineHead(nn.Module):
+    r"""Lightweight Spatial Refinement Head for LUT output.
+
+    Learns residual corrections to compensate for LUT's discrete sampling artifacts,
+    especially in highlight regions with halo/banding issues.
+
+    Args:
+        in_channels (int): Number of input channels (lut_out + lq). Default: 6.
+        hidden (int): Hidden layer dimension. Default: 24.
+        use_backbone_feat (bool): Whether to use backbone features for global modulation. Default: False.
+        backbone_feat_dim (int): Dimension of backbone features. Default: 512.
+    """
+
+    def __init__(self, in_channels=6, hidden=24, use_backbone_feat=False, backbone_feat_dim=512):
+        super().__init__()
+        self.use_backbone_feat = use_backbone_feat
+
+        # Global feature projection (optional)
+        if use_backbone_feat:
+            self.feat_proj = nn.Sequential(
+                nn.Linear(backbone_feat_dim, hidden),
+                nn.ReLU(inplace=True)
+            )
+
+        # Local feature extraction (3x3 receptive field for edge-aware refinement)
+        self.local_feat = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        # Residual prediction
+        self.residual_head = nn.Conv2d(hidden, 3, 1)
+
+        # Adaptive mask (learns where to refine)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # Learnable residual scale
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        r"""Initialize weights for near-identity mapping at start."""
+        # Residual starts near zero
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+        # Mask biased towards small values initially: sigmoid(-2) ≈ 0.12
+        nn.init.constant_(self.mask_head[0].bias, -2.0)
+
+    def forward(self, lut_out, lq, backbone_feat=None):
+        r"""Forward function.
+
+        Args:
+            lut_out (Tensor): LUT transformed output, shape (B, 3, H, W).
+            lq (Tensor): Original input image, shape (B, 3, H, W).
+            backbone_feat (Tensor, optional): Backbone feature vector, shape (B, feat_dim).
+
+        Returns:
+            tuple(Tensor, Tensor):
+                - refined: Refined output, shape (B, 3, H, W).
+                - mask: Refinement mask, shape (B, 1, H, W).
+        """
+        x = torch.cat([lut_out, lq], dim=1)  # (B, 6, H, W)
+
+        feat = self.local_feat(x)  # (B, hidden, H, W)
+
+        # Global modulation with backbone features (optional)
+        if self.use_backbone_feat and backbone_feat is not None:
+            global_feat = self.feat_proj(backbone_feat)  # (B, hidden)
+            global_feat = global_feat.unsqueeze(-1).unsqueeze(-1)  # (B, hidden, 1, 1)
+            feat = feat * (1 + global_feat)
+
+        # Predict residual and mask
+        residual = torch.tanh(self.residual_head(feat)) * self.residual_scale
+        mask = self.mask_head(feat)
+
+        # Weighted residual addition
+        refined = lut_out + residual * mask
+
+        return refined, mask
+
+
 @MODELS.register_module()
 class AiLUT(BaseModel):
     r"""Adaptive-Interval 3D Lookup Table for real-time image enhancement.
@@ -220,6 +307,16 @@ class AiLUT(BaseModel):
             Default: 0.
         monotonicity_factor (float, optional): Loss weight for the monotonicaity
             regularization term. Default: 10.0.
+        en_refine (bool, optional): Whether to enable spatial refinement head. Default: False.
+        refine_hidden (int, optional): Hidden dimension for refinement head. Default: 24.
+        refine_use_backbone_feat (bool, optional): Whether to use backbone features
+            for global modulation in refinement. Default: False.
+        mask_sparse_factor (float, optional): Loss weight for mask sparsity regularization.
+            Prevents refinement from taking over the entire image. Default: 0.05.
+        residual_reg_factor (float, optional): Loss weight for residual magnitude constraint.
+            Prevents over-correction. Default: 0.005.
+        refine_smooth_factor (float, optional): Loss weight for gradient smoothness in
+            refined regions. Default: 0.0.
         recons_loss (dict, optional): Config for pixel-wise reconstruction loss.
         train_cfg (dict, optional): Config for training. Default: None.
         test_cfg (dict, optional): Config for testing. Default: None.
@@ -238,6 +335,12 @@ class AiLUT(BaseModel):
         sparse_factor=0.0001,
         smooth_factor=0,
         monotonicity_factor=10.0,
+        en_refine=False,
+        refine_hidden=24,
+        refine_use_backbone_feat=False,
+        mask_sparse_factor=0.05,
+        residual_reg_factor=0.005,
+        refine_smooth_factor=0.0,
         recons_loss=dict(type='L2Loss', loss_weight=1.0, reduction='mean'),
         train_cfg=None,
         test_cfg=None):
@@ -264,6 +367,16 @@ class AiLUT(BaseModel):
                                     .repeat(n_colors, 1)
             self.register_buffer('uniform_vertices', uniform_vertices.unsqueeze(0))
 
+        # Spatial refinement head (optional)
+        self.en_refine = en_refine
+        if en_refine:
+            self.refine_head = SpatialRefineHead(
+                in_channels=6,
+                hidden=refine_hidden,
+                use_backbone_feat=refine_use_backbone_feat,
+                backbone_feat_dim=self.backbone.out_channels
+            )
+
         self.n_ranks = n_ranks
         self.n_colors = n_colors
         self.n_vertices = n_vertices
@@ -271,6 +384,10 @@ class AiLUT(BaseModel):
         self.sparse_factor = sparse_factor
         self.smooth_factor = smooth_factor
         self.monotonicity_factor = monotonicity_factor
+        self.refine_use_backbone_feat = refine_use_backbone_feat
+        self.mask_sparse_factor = mask_sparse_factor
+        self.residual_reg_factor = residual_reg_factor
+        self.refine_smooth_factor = refine_smooth_factor
         self.backbone_name = backbone.lower()
 
         self.train_cfg = train_cfg
@@ -284,7 +401,10 @@ class AiLUT(BaseModel):
 
         # fix AdaInt for some steps
         self.n_fix_iters = train_cfg.get('n_fix_iters', 0) if train_cfg else 0
+        # fix Refinement for some steps (new)
+        self.n_fix_refine_iters = train_cfg.get('n_fix_refine_iters', 0) if train_cfg else 0
         self.adaint_fixed = False
+        self.refine_fixed = False
         self.register_buffer('cnt_iters', torch.zeros(1))
 
     def init_weights(self):
@@ -314,8 +434,8 @@ class AiLUT(BaseModel):
         Args:
             img (Tensor): Input image, shape (b, c, h, w).
         Returns:
-            tuple(Tensor, Tensor, Tensor):
-                Output image, LUT weights, Sampling Coordinates.
+            tuple(Tensor, Tensor, Tensor, Tensor or None):
+                Output image, LUT weights, Sampling Coordinates, Refinement mask (if enabled).
         """
         # E: (b, f)
         codes = self.backbone(imgs)
@@ -327,9 +447,17 @@ class AiLUT(BaseModel):
         else:
             vertices = self.uniform_vertices
 
-        outs = ailut_transform(imgs, luts, vertices)
+        lut_out = ailut_transform(imgs, luts, vertices)
 
-        return outs, weights, vertices
+        # Spatial refinement (optional)
+        refine_mask = None
+        if self.en_refine:
+            backbone_feat = codes if self.refine_use_backbone_feat else None
+            outs, refine_mask = self.refine_head(lut_out, imgs, backbone_feat)
+        else:
+            outs = lut_out
+
+        return outs, weights, vertices, refine_mask
 
     @auto_fp16(apply_to=('lq', ))
     def forward(self, lq, gt=None, test_mode=False, **kwargs):
@@ -357,16 +485,52 @@ class AiLUT(BaseModel):
             outputs (dict): Output results.
         """
         losses = dict()
-        output, weights, vertices = self.forward_dummy(lq)
+        output, weights, vertices, refine_mask = self.forward_dummy(lq)
+
+        # Reconstruction loss
         losses['loss_recons'] = self.recons_loss(output, gt)
+
+        # Sparse regularization for LUT weights
         if self.sparse_factor > 0:
             losses['loss_sparse'] = self.sparse_factor * torch.mean(weights.pow(2))
+
+        # LUT smoothness and monotonicity regularization
         reg_smoothness, reg_monotonicity = self.lut_generator.regularizations(
             self.smooth_factor, self.monotonicity_factor)
         if self.smooth_factor > 0:
             losses['loss_smooth'] = reg_smoothness
         if self.monotonicity_factor > 0:
             losses['loss_mono'] = reg_monotonicity
+
+        # Refinement losses (only when refinement is enabled)
+        if self.en_refine and refine_mask is not None:
+            # Mask sparsity: prevent refinement from taking over entire image
+            if self.mask_sparse_factor > 0:
+                losses['loss_mask_sparse'] = self.mask_sparse_factor * refine_mask.mean()
+
+            # Residual magnitude constraint: prevent over-correction
+            if self.residual_reg_factor > 0:
+                # Get LUT output by running forward without refinement
+                with torch.no_grad():
+                    codes = self.backbone(lq)
+                    _, luts = self.lut_generator(codes)
+                    if self.en_adaint:
+                        verts = self.adaint(codes)
+                    else:
+                        verts = self.uniform_vertices
+                    lut_out = ailut_transform(lq, luts, verts)
+                residual = output - lut_out
+                losses['loss_residual_reg'] = self.residual_reg_factor * residual.abs().mean()
+
+            # Gradient smoothness in refined regions
+            if self.refine_smooth_factor > 0:
+                dx = output[..., :, 1:] - output[..., :, :-1]
+                dy = output[..., 1:, :] - output[..., :-1, :]
+                mask_x = refine_mask[..., :, 1:]
+                mask_y = refine_mask[..., 1:, :]
+                losses['loss_refine_smooth'] = self.refine_smooth_factor * (
+                    (dx.abs() * mask_x).mean() + (dy.abs() * mask_y).mean())
+
         outputs = dict(
             losses=losses,
             num_samples=len(gt.data),
@@ -392,7 +556,7 @@ class AiLUT(BaseModel):
         Returns:
             outputs (dict): Output results.
         """
-        output, _, _ = self.forward_dummy(lq)
+        output, _, _, _ = self.forward_dummy(lq)
         if self.test_cfg is not None and self.test_cfg.get('metrics', None):
             assert gt is not None, (
                 'evaluation with metrics must have gt images.')
@@ -438,6 +602,18 @@ class AiLUT(BaseModel):
             if self.adaint_fixed:
                 self.adaint_fixed = False
                 get_root_logger().info(f'Unfix AdaInt after {self.n_fix_iters} iters.')
+
+        # fix Refinement head in the first several epochs (let LUT learn first)
+        if self.en_refine and self.cnt_iters < self.n_fix_refine_iters:
+            if not self.refine_fixed:
+                self.refine_fixed = True
+                self.refine_head.requires_grad_(False)
+                get_root_logger().info(f'Fix RefineHead for {self.n_fix_refine_iters} iters.')
+        elif self.en_refine and self.cnt_iters == self.n_fix_refine_iters:
+            self.refine_head.requires_grad_(True)
+            if self.refine_fixed:
+                self.refine_fixed = False
+                get_root_logger().info(f'Unfix RefineHead after {self.n_fix_refine_iters} iters.')
 
         outputs = self(**data_batch, test_mode=False)
         loss, log_vars = self.parse_losses(outputs.pop('losses'))

@@ -1,4 +1,4 @@
-exp_name = 'ailut_hdrtv'
+exp_name = 'ailut_hdrtv_refine'
 
 custom_imports=dict(
     imports=['adaint'],
@@ -11,15 +11,26 @@ model = dict(
     n_vertices=33,
     en_adaint=True,
     en_adaint_share=False,
-    backbone='res18', # 'tpami'
+    backbone='res18',
     pretrained=True,
     n_colors=3,
     sparse_factor=0.0001,
     smooth_factor=0,
     monotonicity_factor=10.0,
+    # === Refinement 配置 ===
+    en_refine=True,                    # 启用 refinement
+    refine_hidden=24,                  # 隐藏层维度
+    refine_use_backbone_feat=False,    # 是否复用 backbone 特征
+    mask_sparse_factor=0.05,           # mask 稀疏正则
+    residual_reg_factor=0.005,         # 残差幅度约束
+    refine_smooth_factor=0.0,          # 梯度平滑 (可选)
     recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'))
+
 # model training and testing settings
-train_cfg = dict(n_fix_iters=3329*5)
+train_cfg = dict(
+    n_fix_iters=3329*5,           # AdaInt 冻结 5 个 epoch
+    n_fix_refine_iters=3329*10    # Refinement 冻结 10 个 epoch (让 LUT 先学)
+)
 test_cfg = dict(metrics=['PSNR'], crop_border=0)
 
 # dataset settings
@@ -115,7 +126,10 @@ optimizers = dict(
     weight_decay=0,
     betas=(0.9, 0.999),
     eps=1e-8,
-    paramwise_cfg=dict(custom_keys={'adaint': dict(lr_mult=0.1)}))
+    paramwise_cfg=dict(custom_keys={
+        'adaint': dict(lr_mult=0.1),
+        'refine_head': dict(lr_mult=0.1)  # refinement 用小学习率
+    }))
 lr_config = None
 
 # learning policy
