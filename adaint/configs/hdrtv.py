@@ -30,11 +30,8 @@ model = dict(
     #    criterion='l1'
     #),
 
-    # Gradient loss for smoother color transitions
-    gradient_loss=dict(
-        type='GradientLoss',
-        loss_weight=0.1
-    ),
+    # Global gradient loss (disabled, replaced by highlight-only version)
+    gradient_loss=None,
 
     # Color gamut loss to expand HDR color range
     gamut_loss=dict(
@@ -44,20 +41,45 @@ model = dict(
         color_space='rgb'
     ),
 
-    # HDR tone mapping loss to preserve HDR characteristics
+    # HDR tone mapping loss (reduced to avoid amplifying blocking)
     hdr_tone_loss=dict(
         type='HDRToneLoss',
-        loss_weight=0.2,
+        loss_weight=0.01,  # Reduced from 0.05
         epsilon=1e-6
     ),
 
-    # Edge-aware weighting to reduce blocky artifacts
-    edge_aware_weight=0.1,
+    # Edge-aware weighting (disabled)
+    edge_aware_weight=0.0,
 
-    # Regularization factors
+    # === NEW: Highlight-aware losses ===
+    # Use Charbonnier in highlight regions instead of MSE
+    highlight_charb_weight=1.0,
+
+    # Gamma warp for AdaInt vertices to densify highlight sampling
+    highlight_sampling_gamma=2.2,
+
+    # Highlight-only gradient loss (replaces global gradient_loss)
+    highlight_gradient_weight=0.3,
+
+    # Highlight-only chroma loss (proper chroma = RGB/luma, key for color blocking)
+    highlight_chroma_weight=0.6,
+
+    # Legacy chroma smooth (can disable if using highlight_chroma_weight)
+    chroma_smooth_weight=0.0,  # Disabled, replaced by highlight_chroma_weight
+
+    # === Regularization factors ===
     sparse_factor=0.0001,
-    smooth_factor=0.2,  # Enabled for LUT smoothness
-    monotonicity_factor=10.0
+    smooth_factor=0.0,  # Disabled original TV (replaced by curvature)
+
+    # Soft-monotonicity: allow larger local rollback for smoother transitions
+    # Key insight: mono=0 means LUT is strictly monotonic = staircase = blocking
+    # Scaled for n_vertices=65 (was 10.0 for n_vertices=33)
+    monotonicity_factor=5.5,
+    mono_delta=0.1,  # Increased from 0.0075 to 0.1 (~10% tolerance, aggressive)
+
+    # 2nd-order curvature on luminance axis (key for reducing highlight banding)
+    # Scaled for n_vertices=65 (was 50.0 for n_vertices=33)
+    curvature_factor=13.0
 )
 # model training and testing settings
 train_cfg = dict(n_fix_iters=3329*5)

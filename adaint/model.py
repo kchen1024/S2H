@@ -87,7 +87,7 @@ class Res18Backbone(nn.Module):
 
     def forward(self, imgs):
         imgs = F.interpolate(imgs, size=(self.input_resolution,) * 2,
-            mode='bilinear', align_corners=False)
+            mode='bilinear', align_corners=True)
         return self.net(imgs).view(imgs.shape[0], -1)
 
 
@@ -138,17 +138,43 @@ class LUTGenerator(nn.Module):
         luts = luts.view(x.shape[0], -1, *((self.n_vertices,) * self.n_colors))
         return weights, luts
 
-    def regularizations(self, smoothness, monotonicity):
+    def regularizations(self, smoothness, monotonicity, curvature_weight=0.0, mono_delta=0.0):
+        """LUT regularization with curvature smoothing and soft-monotonicity.
+
+        Args:
+            smoothness: Weight for TV smoothness (original, can be 0)
+            monotonicity: Weight for monotonicity constraint
+            curvature_weight: Weight for 2nd-order curvature on RGB axes (new)
+            mono_delta: Tolerance for soft-monotonicity, allows small local rollback (new)
+        """
         basis_luts = self.basis_luts_bank.weight.t().view(
             self.n_ranks, self.n_colors, *((self.n_vertices,) * self.n_colors))
-        tv, mn = 0, 0
+        tv, mn, curv = 0, 0, 0
+
+        # BT.709 luminance coefficients for R, G, B axes
+        # Weight curvature by each axis's contribution to luminance
+        lum_weights = [0.2126, 0.7152, 0.0722]  # R, G, B
+
         for i in range(2, basis_luts.ndimension()):
             diff = torch.diff(basis_luts.flip(i), dim=i)
             tv += torch.square(diff).sum(0).mean()
-            mn += F.relu(diff).sum(0).mean()
+            # Soft-Mono: allow small local rollback for smoother transitions
+            mn += F.relu(diff - mono_delta).sum(0).mean()
+
+            # 2nd-order curvature: all RGB axes, weighted by luminance contribution
+            if curvature_weight > 0:
+                d2 = torch.diff(diff, dim=i)
+                # Highlight region: last 30% of bins
+                high_start = int(0.7 * (self.n_vertices - 2))
+                # Weight by BT.709 luminance coefficient (i=2→R, i=3→G, i=4→B)
+                axis_weight = lum_weights[i - 2]
+                # Use L2 (sqrt of squared) instead of L1 - more sensitive to banding
+                curv += axis_weight * torch.sqrt(d2[..., high_start:].pow(2) + 1e-6).mean()
+
         reg_smoothness = smoothness * tv
         reg_monotonicity = monotonicity * mn
-        return reg_smoothness, reg_monotonicity
+        reg_curvature = curvature_weight * curv
+        return reg_smoothness, reg_monotonicity, reg_curvature
 
 
 class AdaInt(nn.Module):
@@ -222,6 +248,21 @@ class AiLUT(BaseModel):
             Default: 0.
         monotonicity_factor (float, optional): Loss weight for the monotonicaity
             regularization term. Default: 10.0.
+        mono_delta (float, optional): Tolerance for soft-monotonicity constraint.
+            Allows small local rollback for smoother color transitions. Default: 0.0.
+        curvature_factor (float, optional): Loss weight for 2nd-order curvature smoothing
+            on luminance axis. Reduces highlight banding. Default: 0.0.
+        chroma_smooth_weight (float, optional): Weight for chroma smoothness loss in
+            highlight regions. Reduces color edge artifacts. Default: 0.0.
+        highlight_charb_weight (float, optional): Weight for using Charbonnier loss
+            in highlight regions instead of MSE. Default: 0.0.
+        highlight_sampling_gamma (float, optional): Gamma value for warping AdaInt vertices
+            to densify highlight sampling. gamma > 1 densifies highlights (recommended: 2.2),
+            gamma = 1 no change, gamma < 1 densifies shadows. Default: 1.0.
+        highlight_gradient_weight (float, optional): Weight for gradient smoothness loss
+            applied ONLY in highlight regions. Reduces blocking artifacts. Default: 0.0.
+        highlight_chroma_weight (float, optional): Weight for chroma smoothness loss
+            applied ONLY in highlight regions. Uses proper chroma=RGB/luma. Default: 0.0.
         edge_aware_weight (float, optional): Weight for edge-aware reconstruction loss.
             When > 0, edges detected using Sobel operators will be weighted more heavily
             in the reconstruction loss. Default: 0.0.
@@ -251,6 +292,13 @@ class AiLUT(BaseModel):
         sparse_factor=0.0001,
         smooth_factor=0,
         monotonicity_factor=10.0,
+        mono_delta=0.0,
+        curvature_factor=0.0,
+        chroma_smooth_weight=0.0,
+        highlight_charb_weight=0.0,
+        highlight_sampling_gamma=1.0,
+        highlight_gradient_weight=0.0,
+        highlight_chroma_weight=0.0,
         edge_aware_weight=0.0,
         recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'),
         perceptual_loss=None,
@@ -289,6 +337,13 @@ class AiLUT(BaseModel):
         self.sparse_factor = sparse_factor
         self.smooth_factor = smooth_factor
         self.monotonicity_factor = monotonicity_factor
+        self.mono_delta = mono_delta
+        self.curvature_factor = curvature_factor
+        self.chroma_smooth_weight = chroma_smooth_weight
+        self.highlight_charb_weight = highlight_charb_weight
+        self.highlight_sampling_gamma = highlight_sampling_gamma
+        self.highlight_gradient_weight = highlight_gradient_weight
+        self.highlight_chroma_weight = highlight_chroma_weight
         self.edge_aware_weight = edge_aware_weight
         self.backbone_name = backbone.lower()
 
@@ -349,6 +404,30 @@ class AiLUT(BaseModel):
         # \hat{P}: (b, c, d)
         if self.en_adaint:
             vertices = self.adaint(codes)
+
+            # Gamma warp to densify ONLY highlight sampling (index-based)
+            # Only affects vertices after pivot_idx, leaves dark/mid regions untouched
+            # gamma > 1: densifies highlights (recommended: 2.2)
+            # gamma = 1: no change
+            if self.highlight_sampling_gamma != 1.0:
+                gamma = self.highlight_sampling_gamma
+                pivot = 0.7
+                n = vertices.shape[-1]
+                pivot_idx = int(pivot * (n - 1))
+
+                out = vertices.clone()
+                # Use actual vertex value at pivot_idx as reference (more accurate than fixed 0.7)
+                v_pivot = vertices[..., pivot_idx:pivot_idx+1]
+                # Normalize highlight region to [0, 1], apply gamma, remap back
+                denom = (1.0 - v_pivot).clamp(min=1e-6)
+                vh = (vertices[..., pivot_idx:] - v_pivot) / denom
+                # Clamp vh to [0, 1] to avoid NaN from negative values raised to non-integer power
+                vh = vh.clamp(min=0.0, max=1.0)
+                out[..., pivot_idx:] = v_pivot + (vh ** gamma) * (1.0 - v_pivot)
+
+                vertices = out
+                # Renormalize to ensure last vertex is 1.0
+                vertices = vertices / vertices[:, :, -1:].clamp(min=1e-6)
         else:
             vertices = self.uniform_vertices
 
@@ -382,6 +461,219 @@ class AiLUT(BaseModel):
         edge_weight = edge_weight / edge_weight.mean()  # Normalize to maintain scale
 
         return edge_weight
+
+    def _rgb_to_luma(self, x):
+        """Convert RGB to luminance using BT.709 coefficients."""
+        w = x.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)
+        return (x * w).sum(dim=1, keepdim=True)
+
+    def _preprocess_deblock(self, x, luma_th=0.80, grad_th=0.03):
+        """Deblock for highlight flat regions to reduce 16x16 JPEG block artifacts.
+        
+        Uses multi-scale approach: detects 16x16 block boundaries and smooths them.
+        
+        Args:
+            x (Tensor): Input image, shape (b, c, h, w) in [0, 1].
+            luma_th (float): Luminance threshold for highlight detection.
+            grad_th (float): Gradient threshold for flat region detection.
+            
+        Returns:
+            Tensor: Preprocessed image with reduced block artifacts.
+        """
+        b, c, h, w = x.shape
+        
+        # Step 1: Compute luminance
+        luma = 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
+        
+        # Step 2: Compute gradient magnitude
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                               dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                               dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        grad_x = F.conv2d(F.pad(luma, (1, 1, 1, 1), mode='reflect'), sobel_x)
+        grad_y = F.conv2d(F.pad(luma, (1, 1, 1, 1), mode='reflect'), sobel_y)
+        grad = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+        
+        # Step 3: Soft mask for highlight flat regions
+        mask_luma = torch.sigmoid((luma - luma_th) / 0.05)
+        mask_grad = torch.sigmoid((grad_th - grad) / 0.008)
+        mask = mask_luma * mask_grad
+        
+        # Step 4: Multi-pass blur to handle 16x16 blocks
+        # First pass: 5x5 Gaussian
+        kernel_5 = torch.tensor([[1, 4, 6, 4, 1],
+                                 [4, 16, 24, 16, 4],
+                                 [6, 24, 36, 24, 6],
+                                 [4, 16, 24, 16, 4],
+                                 [1, 4, 6, 4, 1]], 
+                                dtype=x.dtype, device=x.device) / 256.0
+        kernel_5 = kernel_5.view(1, 1, 5, 5).repeat(3, 1, 1, 1)
+        x_blur = F.conv2d(F.pad(x, (2, 2, 2, 2), mode='reflect'), kernel_5, groups=3)
+        
+        # Second pass: another 5x5 for stronger smoothing in masked areas
+        x_blur2 = F.conv2d(F.pad(x_blur, (2, 2, 2, 2), mode='reflect'), kernel_5, groups=3)
+        
+        # Adaptive blend: stronger blur where mask is higher
+        x_smooth = x_blur * (1 - mask) + x_blur2 * mask
+        
+        # Step 5: Blend with original based on mask
+        x = x * (1 - mask) + x_smooth * mask
+        
+        # Step 6: Stronger dither to break block synchronization
+        noise = (torch.rand_like(x) - 0.5) * (1.0 / 255.0)
+        x = torch.clamp(x + mask * noise, 0.0, 1.0)
+        
+        return x
+
+    def _compute_highlight_mask(self, img, soft=True):
+        """Compute dual-zone highlight mask based on luminance.
+        
+        Uses two overlapping sigmoid regions:
+        - Shoulder region (0.45+): catches mid-to-high transition where blocking starts
+        - Extreme highlight (0.75+): stronger weight for very bright areas
+
+        Args:
+            img (Tensor): Input image, shape (b, c, h, w).
+            soft (bool): If True, use soft sigmoid mask. If False, use hard threshold.
+
+        Returns:
+            Tensor: Highlight mask, shape (b, 1, h, w), values in [0, 1].
+        """
+        luma = self._rgb_to_luma(img)
+        if soft:
+            # Dual-zone soft mask for better coverage
+            # Shoulder region: catches blocking that starts in mid-highlights
+            mask_shoulder = torch.sigmoid((luma - 0.45) / 0.15)
+            # Extreme highlight: stronger weight for very bright areas
+            mask_extreme = torch.sigmoid((luma - 0.75) / 0.08)
+            # Combine both zones
+            mask = torch.clamp(mask_shoulder + mask_extreme, 0, 1)
+        else:
+            # Hard mask (original behavior)
+            mask = torch.clamp((luma - 0.7) / 0.3, 0, 1)
+        return mask
+
+    def _highlight_aware_recons_loss(self, pred, target):
+        """Compute reconstruction loss with Charbonnier in highlight regions.
+
+        Uses MSE for mid/low tones and Charbonnier for highlights to reduce blocking.
+        
+        NOTE: mask is computed from PRED, not GT. This allows the network to first
+        increase brightness, then apply smoothing once pred enters highlight range.
+        Using GT mask would prematurely smooth mid-tones that should become highlights.
+
+        Args:
+            pred (Tensor): Predicted image, shape (b, c, h, w).
+            target (Tensor): Ground truth image, shape (b, c, h, w).
+
+        Returns:
+            Tensor: Mixed reconstruction loss.
+        """
+        # Use pred for mask: smooth only when pred is already in highlight range
+        highlight_mask = self._compute_highlight_mask(pred)
+
+        diff_sq = (pred - target) ** 2
+        loss_mse = diff_sq
+        loss_charb = torch.sqrt(diff_sq + 1e-6)
+
+        # Mix: MSE for non-highlight, Charbonnier for highlight
+        mixed_loss = (1 - highlight_mask) * loss_mse + highlight_mask * loss_charb
+        return mixed_loss.mean()
+
+    def _highlight_gradient_loss(self, pred):
+        """Compute gradient smoothness loss ONLY in highlight regions.
+        
+        Penalizes sharp gradients in highlights to reduce blocking artifacts.
+        Weight = mask * luma to focus on bright areas where blocking actually occurs.
+        
+        Args:
+            pred (Tensor): Predicted image, shape (b, c, h, w).
+            
+        Returns:
+            Tensor: Highlight gradient loss.
+        """
+        luma = self._rgb_to_luma(pred)
+        mask = self._compute_highlight_mask(pred, soft=True)
+        
+        # Weight = mask * luma: focus loss on bright areas where blocking occurs
+        weight = mask * luma.clamp(min=0.3)
+        
+        # Spatial gradients
+        gx = pred[..., :, 1:] - pred[..., :, :-1]
+        gy = pred[..., 1:, :] - pred[..., :-1, :]
+        
+        # Align weight with gradient dimensions
+        weight_x = weight[..., :, 1:]
+        weight_y = weight[..., 1:, :]
+        
+        return (gx.abs() * weight_x).mean() + (gy.abs() * weight_y).mean()
+
+    def _highlight_chroma_loss(self, pred):
+        """Compute chroma smoothness loss ONLY in highlight regions.
+        
+        Uses LOG-CHROMA instead of RGB/luma for HDR stability.
+        In extreme highlights, RGB/luma ≈ [1,1,1] has no gradient.
+        Log-chroma = log(RGB) - log(luma) preserves sensitivity in HDR range.
+        
+        Args:
+            pred (Tensor): Predicted image, shape (b, c, h, w).
+            
+        Returns:
+            Tensor: Highlight chroma loss.
+        """
+        luma = self._rgb_to_luma(pred)
+        mask = self._compute_highlight_mask(pred, soft=True)
+        
+        # Weight = mask * luma: focus on bright areas
+        weight = mask * luma.clamp(min=0.3)
+        
+        # Log-chroma: stable in HDR extreme highlights
+        # Clamp to positive values before log to avoid NaN
+        pred_safe = pred.clamp(min=1e-6)
+        luma_safe = luma.clamp(min=1e-6)
+        log_rgb = torch.log(pred_safe + 1e-3)
+        log_luma = torch.log(luma_safe + 1e-3)
+        chroma = log_rgb - log_luma
+        
+        # Spatial gradients of log-chroma
+        gx = chroma[..., :, 1:] - chroma[..., :, :-1]
+        gy = chroma[..., 1:, :] - chroma[..., :-1, :]
+        
+        # Align weight with gradient dimensions
+        weight_x = weight[..., :, 1:]
+        weight_y = weight[..., 1:, :]
+        
+        return (gx.abs() * weight_x).mean() + (gy.abs() * weight_y).mean()
+
+    def _chroma_smooth_loss(self, pred, target):
+        """Compute chroma smoothness loss in highlight regions (legacy).
+
+        Reduces color edge artifacts by encouraging smooth chroma transitions.
+        
+        NOTE: mask is computed from PRED to allow brightness increase first.
+
+        Args:
+            pred (Tensor): Predicted image, shape (b, c, h, w).
+            target (Tensor): Ground truth image, shape (b, c, h, w).
+
+        Returns:
+            Tensor: Chroma smoothness loss.
+        """
+        # Compute luminance
+        Y_pred = self._rgb_to_luma(pred)
+
+        # Chroma = RGB / luma (proper chroma definition)
+        chroma = pred / Y_pred.clamp(min=1e-6)
+
+        # Highlight mask from PRED (not GT) - smooth only when pred is in highlight
+        mask = self._compute_highlight_mask(pred, soft=True)
+
+        # Spatial smoothness on chroma
+        dx = torch.abs(chroma[:, :, :, :-1] - chroma[:, :, :, 1:])
+        dy = torch.abs(chroma[:, :, :-1, :] - chroma[:, :, 1:, :])
+
+        loss = (dx * mask[:, :, :, :-1]).mean() + (dy * mask[:, :, :-1, :]).mean()
+        return loss
 
     def _weighted_recons_loss(self, pred, target, weight):
         r"""Compute weighted reconstruction loss.
@@ -426,12 +718,29 @@ class AiLUT(BaseModel):
         losses = dict()
         output, weights, vertices = self.forward_dummy(lq)
 
-        # Reconstruction loss (with optional edge weighting)
-        if self.edge_aware_weight > 0:
+        # Reconstruction loss
+        if self.highlight_charb_weight > 0:
+            # Highlight-aware: MSE for mid/low, Charbonnier for highlights
+            losses['loss_recons'] = self.highlight_charb_weight * self._highlight_aware_recons_loss(output, gt)
+        elif self.edge_aware_weight > 0:
+            # Edge-aware weighting
             edge_weight = self._compute_edge_weight(gt)
             losses['loss_recons'] = self._weighted_recons_loss(output, gt, edge_weight)
         else:
+            # Standard reconstruction loss
             losses['loss_recons'] = self.recons_loss(output, gt)
+
+        # Chroma smoothness loss for highlight regions (legacy)
+        if self.chroma_smooth_weight > 0:
+            losses['loss_chroma_smooth'] = self.chroma_smooth_weight * self._chroma_smooth_loss(output, gt)
+
+        # NEW: Highlight-only gradient loss (replaces global gradient loss for HDR)
+        if self.highlight_gradient_weight > 0:
+            losses['loss_highlight_grad'] = self.highlight_gradient_weight * self._highlight_gradient_loss(output)
+
+        # NEW: Highlight-only chroma loss (proper chroma = RGB/luma)
+        if self.highlight_chroma_weight > 0:
+            losses['loss_highlight_chroma'] = self.highlight_chroma_weight * self._highlight_chroma_loss(output)
 
         # Perceptual loss
         if self.perceptual_loss is not None:
@@ -456,12 +765,17 @@ class AiLUT(BaseModel):
         # Existing regularization losses
         if self.sparse_factor > 0:
             losses['loss_sparse'] = self.sparse_factor * torch.mean(weights.pow(2))
-        reg_smoothness, reg_monotonicity = self.lut_generator.regularizations(
-            self.smooth_factor, self.monotonicity_factor)
+
+        # LUT regularization with new curvature and soft-mono
+        reg_smoothness, reg_monotonicity, reg_curvature = self.lut_generator.regularizations(
+            self.smooth_factor, self.monotonicity_factor,
+            self.curvature_factor, self.mono_delta)
         if self.smooth_factor > 0:
             losses['loss_smooth'] = reg_smoothness
         if self.monotonicity_factor > 0:
             losses['loss_mono'] = reg_monotonicity
+        if self.curvature_factor > 0:
+            losses['loss_curvature'] = reg_curvature
 
         outputs = dict(
             losses=losses,
@@ -488,6 +802,9 @@ class AiLUT(BaseModel):
         Returns:
             outputs (dict): Output results.
         """
+        # Deblock + dither for highlight flat regions to reduce JPEG block artifacts
+        #lq = self._preprocess_deblock(lq)
+
         output, _, _ = self.forward_dummy(lq)
         if self.test_cfg is not None and self.test_cfg.get('metrics', None):
             assert gt is not None, (
