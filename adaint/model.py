@@ -200,86 +200,68 @@ class AdaInt(nn.Module):
 class SpatialRefineHead(nn.Module):
     r"""Lightweight Spatial Refinement Head for LUT output.
 
-    Learns residual corrections to compensate for LUT's discrete sampling artifacts,
-    especially in highlight regions with halo/banding issues.
+    低分辨率处理 + 深度可分离卷积，专门针对 16x16 banding 和云层分层问题。
+    
+    设计思路：
+    - 下采样 4x 后处理，感受野覆盖多个 16x16 块
+    - 深度可分离卷积减少计算量
+    - 上采样产生自然平滑的残差，不引入新伪影
+    
+    4K 推理约 1-3ms (vs 全分辨率 10-20ms)
 
     Args:
         in_channels (int): Number of input channels (lut_out + lq). Default: 6.
-        hidden (int): Hidden layer dimension. Default: 24.
-        use_backbone_feat (bool): Whether to use backbone features for global modulation. Default: False.
-        backbone_feat_dim (int): Dimension of backbone features. Default: 512.
+        hidden (int): Hidden layer dimension. Default: 16.
+        scale_factor (int): Downsampling factor. Default: 4.
     """
 
-    def __init__(self, in_channels=6, hidden=24, use_backbone_feat=False, backbone_feat_dim=512):
+    def __init__(self, in_channels=6, hidden=16, scale_factor=4):
         super().__init__()
-        self.use_backbone_feat = use_backbone_feat
+        self.scale_factor = scale_factor
 
-        # Global feature projection (optional)
-        if use_backbone_feat:
-            self.feat_proj = nn.Sequential(
-                nn.Linear(backbone_feat_dim, hidden),
-                nn.ReLU(inplace=True)
-            )
-
-        # Local feature extraction - use LeakyReLU to avoid dead neurons
-        self.local_feat = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 3, padding=1),
+        # 深度可分离卷积 (在低分辨率上处理)
+        self.net = nn.Sequential(
+            # depthwise conv1
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1),
+            # pointwise conv1
+            nn.Conv2d(in_channels, hidden, 1),
             nn.LeakyReLU(0.2, inplace=True),
-        )
-
-        # Residual prediction - direct 3 channel output
-        self.residual_head = nn.Conv2d(hidden, 3, 1)
-
-        # Adaptive mask (learns where to refine) - for visualization
-        self.mask_head = nn.Sequential(
-            nn.Conv2d(hidden, 1, 1),
-            nn.Sigmoid()
+            # depthwise conv2
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
+            nn.LeakyReLU(0.2, inplace=True),
+            # output
+            nn.Conv2d(hidden, 3, 1)
         )
 
         self._init_weights()
 
     def _init_weights(self):
         r"""Initialize weights for near-identity mapping at start."""
-        # Use default kaiming init for conv layers (already done by PyTorch)
-        # Just ensure residual_head starts small
-        nn.init.xavier_uniform_(self.residual_head.weight, gain=0.5)
-        nn.init.zeros_(self.residual_head.bias)
+        # 最后一层小初始化，开始时残差接近 0
+        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.1)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, lut_out, lq, backbone_feat=None):
-        r"""Forward function.
-
-        Args:
-            lut_out (Tensor): LUT transformed output, shape (B, 3, H, W).
-            lq (Tensor): Original input image, shape (B, 3, H, W).
-            backbone_feat (Tensor, optional): Backbone feature vector, shape (B, feat_dim).
-
-        Returns:
-            tuple(Tensor, Tensor):
-                - refined: Refined output, shape (B, 3, H, W).
-                - mask: Refinement mask, shape (B, 1, H, W).
-        """
+        r"""Forward function."""
+        H, W = lut_out.shape[2:]
         x = torch.cat([lut_out, lq], dim=1)  # (B, 6, H, W)
 
-        feat = self.local_feat(x)  # (B, hidden, H, W)
-
-        # Global modulation with backbone features (optional)
-        if self.use_backbone_feat and backbone_feat is not None:
-            global_feat = self.feat_proj(backbone_feat)  # (B, hidden)
-            global_feat = global_feat.unsqueeze(-1).unsqueeze(-1)  # (B, hidden, 1, 1)
-            feat = feat * (1 + global_feat)
-
-        # Predict residual - scale to small range [-0.05, 0.05]
-        residual = torch.tanh(self.residual_head(feat)) * 0.05
+        # 下采样到低分辨率
+        x_low = F.interpolate(x, scale_factor=1/self.scale_factor,
+                              mode='bilinear', align_corners=False)
         
-        # Mask for visualization/analysis only
-        mask = self.mask_head(feat)
+        # 低分辨率特征提取和残差预测
+        res_low = torch.tanh(self.net(x_low)) * 0.1  # 残差范围 ±0.1
+        
+        # 上采样回原分辨率 (bilinear 产生平滑过渡)
+        residual = F.interpolate(res_low, size=(H, W),
+                                 mode='bilinear', align_corners=False)
 
-        # Direct residual addition
         refined = lut_out + residual
 
-        return refined, mask, residual  # 返回 residual 用于调试
+        # 返回 None 作为 mask (不再使用 mask)
+        return refined, None, residual
 
 
 @MODELS.register_module()
@@ -334,11 +316,9 @@ class AiLUT(BaseModel):
         smooth_factor=0,
         monotonicity_factor=10.0,
         en_refine=False,
-        refine_hidden=24,
-        refine_use_backbone_feat=False,
-        mask_sparse_factor=0.05,
-        residual_reg_factor=0.005,
-        refine_smooth_factor=0.0,
+        refine_hidden=16,
+        refine_scale_factor=4,
+        residual_reg_factor=0.0,
         recons_loss=dict(type='L2Loss', loss_weight=1.0, reduction='mean'),
         train_cfg=None,
         test_cfg=None):
@@ -371,8 +351,7 @@ class AiLUT(BaseModel):
             self.refine_head = SpatialRefineHead(
                 in_channels=6,
                 hidden=refine_hidden,
-                use_backbone_feat=refine_use_backbone_feat,
-                backbone_feat_dim=self.backbone.out_channels
+                scale_factor=refine_scale_factor
             )
 
         self.n_ranks = n_ranks
@@ -382,10 +361,7 @@ class AiLUT(BaseModel):
         self.sparse_factor = sparse_factor
         self.smooth_factor = smooth_factor
         self.monotonicity_factor = monotonicity_factor
-        self.refine_use_backbone_feat = refine_use_backbone_feat
-        self.mask_sparse_factor = mask_sparse_factor
         self.residual_reg_factor = residual_reg_factor
-        self.refine_smooth_factor = refine_smooth_factor
         self.backbone_name = backbone.lower()
 
         self.train_cfg = train_cfg
@@ -448,15 +424,13 @@ class AiLUT(BaseModel):
         lut_out = ailut_transform(imgs, luts, vertices)
 
         # Spatial refinement (optional)
-        refine_mask = None
         refine_residual = None
         if self.en_refine:
-            backbone_feat = codes if self.refine_use_backbone_feat else None
-            outs, refine_mask, refine_residual = self.refine_head(lut_out, imgs, backbone_feat)
+            outs, _, refine_residual = self.refine_head(lut_out, imgs, None)
         else:
             outs = lut_out
 
-        return outs, weights, vertices, refine_mask, refine_residual
+        return outs, weights, vertices, None, refine_residual
 
     @auto_fp16(apply_to=('lq', ))
     def forward(self, lq, gt=None, test_mode=False, **kwargs):
@@ -508,22 +482,9 @@ class AiLUT(BaseModel):
             if iter_count % 100 == 0:
                 print(f"[DEBUG iter={iter_count}] residual: min={refine_residual.min().item():.6f}, max={refine_residual.max().item():.6f}, abs_mean={refine_residual.abs().mean().item():.6f}")
 
-            # Mask sparsity (disabled by default now)
-            if self.mask_sparse_factor > 0:
-                losses['loss_mask_sparse'] = self.mask_sparse_factor * refine_mask.mean()
-            
-            # Residual magnitude constraint
+            # Residual magnitude constraint (optional, default disabled)
             if self.residual_reg_factor > 0:
                 losses['loss_residual_reg'] = self.residual_reg_factor * refine_residual.abs().mean()
-
-            # Gradient smoothness in refined regions
-            if self.refine_smooth_factor > 0:
-                dx = output[..., :, 1:] - output[..., :, :-1]
-                dy = output[..., 1:, :] - output[..., :-1, :]
-                mask_x = refine_mask[..., :, 1:]
-                mask_y = refine_mask[..., 1:, :]
-                losses['loss_refine_smooth'] = self.refine_smooth_factor * (
-                    (dx.abs() * mask_x).mean() + (dy.abs() * mask_y).mean())
 
         outputs = dict(
             losses=losses,
@@ -645,9 +606,10 @@ class AiLUT(BaseModel):
         Returns:
             dict: Evaluation results.
         """
+        import cv2
         crop_border = self.test_cfg.crop_border
 
-        # 直接用 tensor 计算 PSNR，保持 float32 精度，不量化到 8-bit
+        # 直接用 tensor 计算，保持 float32 精度，不量化到 8-bit
         output_np = output.squeeze(0).float().detach().cpu().clamp_(0, 1).numpy()
         gt_np = gt.squeeze(0).float().detach().cpu().clamp_(0, 1).numpy()
         
@@ -668,7 +630,23 @@ class AiLUT(BaseModel):
                 else:
                     eval_result['PSNR'] = 20. * np.log10(1.0 / np.sqrt(mse))  # max=1.0 for [0,1] range
             elif metric == 'SSIM':
-                # SSIM 仍用 8-bit，因为原实现依赖 255 范围
-                eval_result['SSIM'] = self.allowed_metrics['SSIM'](
-                    tensor2img(output), tensor2img(gt), crop_border)
+                # Float32 SSIM，范围 [0,1]
+                C1 = (0.01) ** 2  # 对应 max=1.0
+                C2 = (0.03) ** 2
+                ssims = []
+                for i in range(output_np.shape[2]):
+                    img1 = output_np[..., i].astype(np.float64)
+                    img2 = gt_np[..., i].astype(np.float64)
+                    kernel = cv2.getGaussianKernel(11, 1.5)
+                    window = np.outer(kernel, kernel.transpose())
+                    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+                    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+                    mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
+                    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+                    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+                    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+                    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+                    ssims.append(ssim_map.mean())
+                eval_result['SSIM'] = np.mean(ssims)
         return eval_result

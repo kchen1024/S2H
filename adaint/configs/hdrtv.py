@@ -19,19 +19,17 @@ model = dict(
     monotonicity_factor=10.0,
     # === Refinement 配置 ===
     en_refine=True,                    # 启用 refinement
-    refine_hidden=32,                  # 隐藏层维度
-    refine_use_backbone_feat=False,    # 是否复用 backbone 特征
-    mask_sparse_factor=0.0,            # 不惩罚 mask
-    residual_reg_factor=0.01,          # 轻惩罚，让 RefineHead 更自由地修复 banding
-    refine_smooth_factor=0.0,          # 梯度平滑 (可选)
+    refine_hidden=16,                  # 隐藏层维度 (轻量)
+    refine_scale_factor=4,             # 下采样倍数 (4K -> 960x540)
+    residual_reg_factor=0.0,           # 不惩罚 residual
     recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'))
 
 # model training and testing settings
 train_cfg = dict(
-    n_fix_iters=77 * 20,            # AdaInt 冻结 20 个 epoch
-    n_fix_refine_iters=77 * 100     # RefineHead 冻结 100 个 epoch，让 LUT 充分学习
+    n_fix_iters=77 * 5,              # AdaInt 冻结 5 个 epoch (让 backbone 先稳定)
+    n_fix_refine_iters=77 * 50       # RefineHead 冻结 50 个 epoch，让 LUT 先学好色彩映射
 )
-test_cfg = dict(metrics=['PSNR'], crop_border=0)
+test_cfg = dict(metrics=['PSNR', 'SSIM'], crop_border=0)
 
 # dataset settings
 train_dataset_type = 'HDRTV1K'
@@ -132,10 +130,11 @@ optimizers = dict(
 lr_config = None
 
 # learning policy
-total_iters = 77 * 500  # 500 epoch，前 100 epoch 只训练 LUT，后 400 epoch 联合训练
+# 总共 300 epoch: 前 50 epoch 只训练 LUT，后 250 epoch 联合训练
+total_iters = 77 * 300
 
 checkpoint_config = dict(interval=7700, save_optimizer=True, by_epoch=False)  # 每 100 epoch 保存一次
-evaluation = dict(interval=1540, save_image=True)  # 每 20 个 epoch 评估一次
+evaluation = dict(interval=770, save_image=True)  # 每 10 个 epoch 评估一次
 log_config = dict(
     interval=100,
     hooks=[
