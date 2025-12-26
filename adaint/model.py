@@ -85,7 +85,7 @@ class Res18Backbone(nn.Module):
 
     def forward(self, imgs):
         imgs = F.interpolate(imgs, size=(self.input_resolution,) * 2,
-            mode='bilinear', align_corners=False)
+            mode='bilinear', align_corners=True)
         return self.net(imgs).view(imgs.shape[0], -1)
 
 
@@ -197,40 +197,38 @@ class AdaInt(nn.Module):
         return vertices
 
 
-class SpatialRefineHead(nn.Module):
-    r"""Lightweight Spatial Refinement Head for LUT output.
-
-    低分辨率处理 + 深度可分离卷积，专门针对 16x16 banding 和云层分层问题。
+class PreRefineHead(nn.Module):
+    r"""LUT 前处理：平滑 SDR 输入的块状伪影和色阶分层
+    
+    在源头处理问题，避免 LUT 放大伪影。
+    低分辨率处理 + 上采样产生平滑残差。
     
     设计思路：
-    - 下采样 4x 后处理，感受野覆盖多个 16x16 块
-    - 深度可分离卷积减少计算量
-    - 上采样产生自然平滑的残差，不引入新伪影
+    - 16x16 编码块和高亮分层都是低频问题
+    - 下采样 4x 后处理，感受野覆盖多个块
+    - 上采样产生自然平滑的残差
+    - 只修正输入，不改变 LUT 的自适应能力
     
-    4K 推理约 1-3ms (vs 全分辨率 10-20ms)
+    4K 推理约 1-2ms
 
     Args:
-        in_channels (int): Number of input channels (lut_out + lq). Default: 6.
+        in_channels (int): Number of input channels. Default: 3.
         hidden (int): Hidden layer dimension. Default: 16.
         scale_factor (int): Downsampling factor. Default: 4.
+        residual_scale (float): Scale for residual output. Default: 0.05.
     """
 
-    def __init__(self, in_channels=6, hidden=16, scale_factor=4):
+    def __init__(self, in_channels=3, hidden=16, scale_factor=4, residual_scale=0.05):
         super().__init__()
         self.scale_factor = scale_factor
+        self.residual_scale = residual_scale
 
-        # 深度可分离卷积 (在低分辨率上处理)
+        # 低分辨率处理网络
         self.net = nn.Sequential(
-            # depthwise conv1
-            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            # pointwise conv1
-            nn.Conv2d(in_channels, hidden, 1),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            # depthwise conv2
-            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
-            nn.LeakyReLU(0.2, inplace=True),
-            # output
             nn.Conv2d(hidden, 3, 1)
         )
 
@@ -238,30 +236,116 @@ class SpatialRefineHead(nn.Module):
 
     def _init_weights(self):
         r"""Initialize weights for near-identity mapping at start."""
-        # 最后一层小初始化，开始时残差接近 0
         nn.init.xavier_uniform_(self.net[-1].weight, gain=0.1)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, lut_out, lq, backbone_feat=None):
-        r"""Forward function."""
-        H, W = lut_out.shape[2:]
-        x = torch.cat([lut_out, lq], dim=1)  # (B, 6, H, W)
+    def forward(self, x):
+        r"""Forward function.
+        
+        Args:
+            x (Tensor): Input SDR image, shape (B, 3, H, W).
+        
+        Returns:
+            Tensor: Refined SDR image.
+            Tensor: Residual for debugging/loss.
+        """
+        H, W = x.shape[2:]
+        
+        # 计算低分辨率尺寸 (确保是整数)
+        H_low = H // self.scale_factor
+        W_low = W // self.scale_factor
 
         # 下采样到低分辨率
-        x_low = F.interpolate(x, scale_factor=1/self.scale_factor,
-                              mode='bilinear', align_corners=False)
+        x_low = F.interpolate(x, size=(H_low, W_low),
+                              mode='bilinear', align_corners=True)
         
-        # 低分辨率特征提取和残差预测
-        res_low = torch.tanh(self.net(x_low)) * 0.1  # 残差范围 ±0.1
+        # 低分辨率残差预测
+        res_low = torch.tanh(self.net(x_low)) * self.residual_scale
         
         # 上采样回原分辨率 (bilinear 产生平滑过渡)
         residual = F.interpolate(res_low, size=(H, W),
-                                 mode='bilinear', align_corners=False)
+                                 mode='bilinear', align_corners=True)
+
+        refined = x + residual
+        
+        return refined, residual
+
+
+class PostRefineHead(nn.Module):
+    r"""LUT 后处理：修复 LUT 输出中被放大的伪影
+    
+    处理 LUT 变换后残留的块状伪影和色阶分层。
+    结合 LUT 输出和原始 SDR 输入进行修正。
+    
+    设计思路：
+    - LUT 会放大输入的伪影，后处理直接修复放大后的问题
+    - 输入包含 LUT 输出 + SDR，提供更多上下文
+    - 低分辨率处理保持速度
+    
+    4K 推理约 1-2ms
+
+    Args:
+        in_channels (int): Number of input channels (lut_out + sdr). Default: 6.
+        hidden (int): Hidden layer dimension. Default: 16.
+        scale_factor (int): Downsampling factor. Default: 4.
+        residual_scale (float): Scale for residual output. Default: 0.1.
+    """
+
+    def __init__(self, in_channels=6, hidden=16, scale_factor=4, residual_scale=0.1):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.residual_scale = residual_scale
+
+        # 低分辨率处理网络
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden, 3, 1)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        r"""Initialize weights for near-identity mapping at start."""
+        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.1)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, lut_out, sdr):
+        r"""Forward function.
+        
+        Args:
+            lut_out (Tensor): LUT output image, shape (B, 3, H, W).
+            sdr (Tensor): Original SDR input, shape (B, 3, H, W).
+        
+        Returns:
+            Tensor: Refined HDR image.
+            Tensor: Residual for debugging/loss.
+        """
+        H, W = lut_out.shape[2:]
+        
+        # 拼接 LUT 输出和 SDR 输入
+        x = torch.cat([lut_out, sdr], dim=1)  # (B, 6, H, W)
+        
+        # 计算低分辨率尺寸 (确保是整数)
+        H_low = H // self.scale_factor
+        W_low = W // self.scale_factor
+
+        # 下采样到低分辨率
+        x_low = F.interpolate(x, size=(H_low, W_low),
+                              mode='bilinear', align_corners=True)
+        
+        # 低分辨率残差预测
+        res_low = torch.tanh(self.net(x_low)) * self.residual_scale
+        
+        # 上采样回原分辨率 (bilinear 产生平滑过渡)
+        residual = F.interpolate(res_low, size=(H, W),
+                                 mode='bilinear', align_corners=True)
 
         refined = lut_out + residual
-
-        # 返回 None 作为 mask (不再使用 mask)
-        return refined, None, residual
+        
+        return refined, residual
 
 
 @MODELS.register_module()
@@ -316,8 +400,12 @@ class AiLUT(BaseModel):
         smooth_factor=0,
         monotonicity_factor=10.0,
         en_refine=False,
+        en_pre_refine=False,
+        en_post_refine=False,
         refine_hidden=16,
         refine_scale_factor=4,
+        pre_refine_residual_scale=0.1,
+        post_refine_residual_scale=0.1,
         residual_reg_factor=0.0,
         recons_loss=dict(type='L2Loss', loss_weight=1.0, reduction='mean'),
         train_cfg=None,
@@ -345,14 +433,28 @@ class AiLUT(BaseModel):
                                     .repeat(n_colors, 1)
             self.register_buffer('uniform_vertices', uniform_vertices.unsqueeze(0))
 
-        # Spatial refinement head (optional)
-        self.en_refine = en_refine
-        if en_refine:
-            self.refine_head = SpatialRefineHead(
+        # Pre-refinement head (before LUT, optional)
+        self.en_pre_refine = en_pre_refine
+        if en_pre_refine:
+            self.pre_refine = PreRefineHead(
+                in_channels=3,
+                hidden=refine_hidden,
+                scale_factor=refine_scale_factor,
+                residual_scale=pre_refine_residual_scale
+            )
+
+        # Post-refinement head (after LUT, optional)
+        self.en_post_refine = en_post_refine
+        if en_post_refine:
+            self.post_refine = PostRefineHead(
                 in_channels=6,
                 hidden=refine_hidden,
-                scale_factor=refine_scale_factor
+                scale_factor=refine_scale_factor,
+                residual_scale=post_refine_residual_scale
             )
+        
+        # 兼容旧配置
+        self.en_refine = en_refine or en_pre_refine or en_post_refine
 
         self.n_ranks = n_ranks
         self.n_colors = n_colors
@@ -408,10 +510,11 @@ class AiLUT(BaseModel):
         Args:
             img (Tensor): Input image, shape (b, c, h, w).
         Returns:
-            tuple(Tensor, Tensor, Tensor, Tensor or None):
-                Output image, LUT weights, Sampling Coordinates, Refinement mask (if enabled).
+            tuple(Tensor, Tensor, Tensor, Tensor, Tensor):
+                Output image, LUT weights, Sampling Coordinates, 
+                Pre-refine residual (if enabled), Post-refine residual (if enabled).
         """
-        # E: (b, f)
+        # E: (b, f) - Backbone 用原始图像提取特征
         codes = self.backbone(imgs)
         # (b, m), T: (b, c, d, d, d)
         weights, luts = self.lut_generator(codes)
@@ -421,16 +524,24 @@ class AiLUT(BaseModel):
         else:
             vertices = self.uniform_vertices
 
-        lut_out = ailut_transform(imgs, luts, vertices)
+        # Pre-refinement: 平滑输入图像 (可选)
+        pre_refine_residual = None
+        if self.en_pre_refine:
+            imgs_for_lut, pre_refine_residual = self.pre_refine(imgs)
+        else:
+            imgs_for_lut = imgs
 
-        # Spatial refinement (optional)
-        refine_residual = None
-        if self.en_refine:
-            outs, _, refine_residual = self.refine_head(lut_out, imgs, None)
+        # LUT 变换
+        lut_out = ailut_transform(imgs_for_lut, luts, vertices)
+
+        # Post-refinement: 修复 LUT 输出的伪影 (可选)
+        post_refine_residual = None
+        if self.en_post_refine:
+            outs, post_refine_residual = self.post_refine(lut_out, imgs)
         else:
             outs = lut_out
 
-        return outs, weights, vertices, None, refine_residual
+        return outs, weights, vertices, pre_refine_residual, post_refine_residual
 
     @auto_fp16(apply_to=('lq', ))
     def forward(self, lq, gt=None, test_mode=False, **kwargs):
@@ -458,7 +569,7 @@ class AiLUT(BaseModel):
             outputs (dict): Output results.
         """
         losses = dict()
-        output, weights, vertices, refine_mask, refine_residual = self.forward_dummy(lq)
+        output, weights, vertices, pre_refine_residual, post_refine_residual = self.forward_dummy(lq)
 
         # Reconstruction loss
         losses['loss_recons'] = self.recons_loss(output, gt)
@@ -475,16 +586,22 @@ class AiLUT(BaseModel):
         if self.monotonicity_factor > 0:
             losses['loss_mono'] = reg_monotonicity
 
-        # Refinement losses (only when refinement is enabled)
-        if self.en_refine and refine_residual is not None:
-            # Debug: print every 100 iters
-            iter_count = int(self.cnt_iters.item())
+        # Refinement losses
+        iter_count = int(self.cnt_iters.item())
+        
+        # Pre-refine debug
+        if self.en_pre_refine and pre_refine_residual is not None:
             if iter_count % 100 == 0:
-                print(f"[DEBUG iter={iter_count}] residual: min={refine_residual.min().item():.6f}, max={refine_residual.max().item():.6f}, abs_mean={refine_residual.abs().mean().item():.6f}")
-
-            # Residual magnitude constraint (optional, default disabled)
+                print(f"[DEBUG iter={iter_count}] pre_refine: min={pre_refine_residual.min().item():.6f}, max={pre_refine_residual.max().item():.6f}, abs_mean={pre_refine_residual.abs().mean().item():.6f}")
             if self.residual_reg_factor > 0:
-                losses['loss_residual_reg'] = self.residual_reg_factor * refine_residual.abs().mean()
+                losses['loss_pre_res_reg'] = self.residual_reg_factor * pre_refine_residual.abs().mean()
+
+        # Post-refine debug
+        if self.en_post_refine and post_refine_residual is not None:
+            if iter_count % 100 == 0:
+                print(f"[DEBUG iter={iter_count}] post_refine: min={post_refine_residual.min().item():.6f}, max={post_refine_residual.max().item():.6f}, abs_mean={post_refine_residual.abs().mean().item():.6f}")
+            if self.residual_reg_factor > 0:
+                losses['loss_post_res_reg'] = self.residual_reg_factor * post_refine_residual.abs().mean()
 
         outputs = dict(
             losses=losses,
@@ -560,17 +677,23 @@ class AiLUT(BaseModel):
                 self.adaint_fixed = False
                 get_root_logger().info(f'Unfix AdaInt after {self.n_fix_iters} iters.')
 
-        # fix Refinement head in the first several epochs (let LUT learn first)
-        if self.en_refine and self.cnt_iters < self.n_fix_refine_iters:
+        # fix Refinement heads in the first several epochs (let LUT learn first)
+        if (self.en_pre_refine or self.en_post_refine) and self.cnt_iters < self.n_fix_refine_iters:
             if not self.refine_fixed:
                 self.refine_fixed = True
-                self.refine_head.requires_grad_(False)
-                get_root_logger().info(f'Fix RefineHead for {self.n_fix_refine_iters} iters.')
-        elif self.en_refine and self.cnt_iters == self.n_fix_refine_iters:
-            self.refine_head.requires_grad_(True)
+                if self.en_pre_refine:
+                    self.pre_refine.requires_grad_(False)
+                if self.en_post_refine:
+                    self.post_refine.requires_grad_(False)
+                get_root_logger().info(f'Fix Refine heads for {self.n_fix_refine_iters} iters.')
+        elif (self.en_pre_refine or self.en_post_refine) and self.cnt_iters == self.n_fix_refine_iters:
+            if self.en_pre_refine:
+                self.pre_refine.requires_grad_(True)
+            if self.en_post_refine:
+                self.post_refine.requires_grad_(True)
             if self.refine_fixed:
                 self.refine_fixed = False
-                get_root_logger().info(f'Unfix RefineHead after {self.n_fix_refine_iters} iters.')
+                get_root_logger().info(f'Unfix Refine heads after {self.n_fix_refine_iters} iters.')
 
         outputs = self(**data_batch, test_mode=False)
         loss, log_vars = self.parse_losses(outputs.pop('losses'))

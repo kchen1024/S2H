@@ -17,17 +17,20 @@ model = dict(
     sparse_factor=0.0001,
     smooth_factor=0,
     monotonicity_factor=10.0,
-    # === Refinement 配置 ===
-    en_refine=True,                    # 启用 refinement
-    refine_hidden=16,                  # 隐藏层维度 (轻量)
+    # === Pre + Post Refinement 配置 ===
+    en_pre_refine=True,                # 启用前处理 (平滑 SDR 输入)
+    en_post_refine=True,               # 启用后处理 (修复 LUT 输出)
+    refine_hidden=16,                  # 隐藏层维度
     refine_scale_factor=4,             # 下采样倍数 (4K -> 960x540)
+    pre_refine_residual_scale=0.1,     # 前处理残差范围 ±0.1
+    post_refine_residual_scale=0.1,    # 后处理残差范围 ±0.1
     residual_reg_factor=0.0,           # 不惩罚 residual
     recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'))
 
 # model training and testing settings
 train_cfg = dict(
-    n_fix_iters=77 * 5,              # AdaInt 冻结 5 个 epoch (让 backbone 先稳定)
-    n_fix_refine_iters=77 * 50       # RefineHead 冻结 50 个 epoch，让 LUT 先学好色彩映射
+    n_fix_iters=77 * 5,              # AdaInt 冻结 5 个 epoch
+    n_fix_refine_iters=77 * 50       # Pre/Post Refine 冻结 50 个 epoch，让 LUT 先学好
 )
 test_cfg = dict(metrics=['PSNR', 'SSIM'], crop_border=0)
 
@@ -125,13 +128,14 @@ optimizers = dict(
     eps=1e-8,
     paramwise_cfg=dict(custom_keys={
         'adaint': dict(lr_mult=0.1),
-        'refine_head': dict(lr_mult=1.0)  # 用正常学习率
+        'pre_refine': dict(lr_mult=1.0),   # 前处理用正常学习率
+        'post_refine': dict(lr_mult=1.0)   # 后处理用正常学习率
     }))
 lr_config = None
 
 # learning policy
-# 总共 300 epoch: 前 50 epoch 只训练 LUT，后 250 epoch 联合训练
-total_iters = 77 * 300
+# 总共 500 epoch: 前 50 epoch 只训练 LUT，后 450 epoch 联合训练
+total_iters = 77 * 500
 
 checkpoint_config = dict(interval=7700, save_optimizer=True, by_epoch=False)  # 每 100 epoch 保存一次
 evaluation = dict(interval=770, save_image=True)  # 每 10 个 epoch 评估一次
