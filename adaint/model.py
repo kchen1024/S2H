@@ -85,7 +85,7 @@ class Res18Backbone(nn.Module):
 
     def forward(self, imgs):
         imgs = F.interpolate(imgs, size=(self.input_resolution,) * 2,
-            mode='bilinear', align_corners=False)
+            mode='bilinear', align_corners=True)
         return self.net(imgs).view(imgs.shape[0], -1)
 
 
@@ -414,7 +414,9 @@ class AiLUT(BaseModel):
             else:
                 raise ValueError('iteration should be number or None, '
                                  f'but got {type(iteration)}')
-            mmcv.imwrite(tensor2img(output,  out_type=np.uint16), save_path)
+            output_img = tensor2img(output, out_type=np.uint16)
+            output_img = output_img[:, :, ::-1]  # BGR -> RGBï¼Œä¸Ž test.py ä¿æŒä¸€è‡´
+            mmcv.imwrite(output_img, save_path)
 
         return results
 
@@ -473,13 +475,43 @@ class AiLUT(BaseModel):
         Returns:
             dict: Evaluation results.
         """
+        import cv2
         crop_border = self.test_cfg.crop_border
 
-        output = tensor2img(output)
-        gt = tensor2img(gt)
+        output_np = output.squeeze(0).float().detach().cpu().clamp_(0, 1).numpy()
+        gt_np = gt.squeeze(0).float().detach().cpu().clamp_(0, 1).numpy()
+        # CHW -> HWC
+        output_np = output_np.transpose(1, 2, 0)
+        gt_np = gt_np.transpose(1, 2, 0)
+        if crop_border != 0:
+            output_np = output_np[crop_border:-crop_border, crop_border:-crop_border, :]
+            gt_np = gt_np[crop_border:-crop_border, crop_border:-crop_border, :]
 
         eval_result = dict()
         for metric in self.test_cfg.metrics:
-            eval_result[metric] = self.allowed_metrics[metric](
-                output, gt, crop_border)
+            if metric == 'PSNR':
+                mse = np.mean((output_np - gt_np) ** 2)
+                if mse == 0:
+                    eval_result['PSNR'] = float('inf')
+                else:
+                    eval_result['PSNR'] = 20. * np.log10(1.0 / np.sqrt(mse))  # max=1.0 for [0,1] range
+            elif metric == 'SSIM':
+                C1 = (0.01) ** 2 
+                C2 = (0.03) ** 2
+                ssims = []
+                for i in range(output_np.shape[2]):
+                    img1 = output_np[..., i].astype(np.float64)
+                    img2 = gt_np[..., i].astype(np.float64)
+                    kernel = cv2.getGaussianKernel(11, 1.5)
+                    window = np.outer(kernel, kernel.transpose())
+                    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+                    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+                    mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
+                    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+                    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+                    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+                    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+                    ssims.append(ssim_map.mean())
+                eval_result['SSIM'] = np.mean(ssims)
         return eval_result
