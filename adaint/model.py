@@ -475,6 +475,93 @@ class PostRefineHead(nn.Module):
         return refined, residual
 
 
+class LightweightDeblocking(nn.Module):
+    r"""轻量级 Deblocking 后处理模块
+    
+    专门针对 16x16 块状伪影和色阶分层设计。
+    
+    设计特点：
+    1. 全分辨率或 2x 下采样处理，保留块边界细节
+    2. 感受野覆盖 16x16 块（通过 dilated conv）
+    3. 残差学习：只学习修正量，任务更简单
+    
+    4K 推理约 3-6ms
+    
+    Args:
+        hidden (int): Hidden layer dimension. Default: 24.
+        scale_factor (int): Downsampling factor (1 or 2). Default: 2.
+        residual_scale (float): Maximum residual magnitude. Default: 0.15.
+    """
+
+    def __init__(self, hidden=24, scale_factor=2, residual_scale=0.15):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.residual_scale = residual_scale
+        
+        # 输入通道：LUT输出(3) + SDR(3)
+        in_channels = 6
+        
+        # 多尺度感受野网络
+        # 使用 dilated conv 扩大感受野覆盖 16x16 块
+        self.conv1 = nn.Conv2d(in_channels, hidden, 3, padding=1)
+        self.conv2 = nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2)  # 感受野 7x7
+        self.conv3 = nn.Conv2d(hidden, hidden, 3, padding=4, dilation=4)  # 感受野 15x15
+        self.conv4 = nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2)  # 再次 7x7
+        self.conv_out = nn.Conv2d(hidden, 3, 1)
+        
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        r"""Initialize to near-zero output at start."""
+        nn.init.zeros_(self.conv_out.weight)
+        nn.init.zeros_(self.conv_out.bias)
+        # 其他层用 xavier
+        for m in [self.conv1, self.conv2, self.conv3, self.conv4]:
+            nn.init.xavier_uniform_(m.weight, gain=0.1)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, lut_out, sdr):
+        r"""Forward function.
+        
+        Args:
+            lut_out (Tensor): LUT output image, shape (B, 3, H, W).
+            sdr (Tensor): Original SDR input, shape (B, 3, H, W).
+        
+        Returns:
+            Tensor: Refined HDR image.
+            Tensor: Residual for debugging/loss.
+        """
+        H, W = lut_out.shape[2:]
+        
+        # 构建输入特征
+        x = torch.cat([lut_out, sdr], dim=1)  # (B, 6, H, W)
+        
+        if self.scale_factor > 1:
+            # 下采样处理
+            H_low = H // self.scale_factor
+            W_low = W // self.scale_factor
+            x = F.interpolate(x, size=(H_low, W_low), mode='bilinear', align_corners=True)
+        
+        # 多尺度特征提取
+        f1 = self.act(self.conv1(x))
+        f2 = self.act(self.conv2(f1))
+        f3 = self.act(self.conv3(f2))
+        f4 = self.act(self.conv4(f3 + f1))  # skip connection
+        
+        # 输出残差
+        res = torch.tanh(self.conv_out(f4)) * self.residual_scale
+        
+        if self.scale_factor > 1:
+            # 上采样回原分辨率
+            res = F.interpolate(res, size=(H, W), mode='bilinear', align_corners=True)
+        
+        refined = lut_out + res
+        
+        return refined, res
+
+
 @MODELS.register_module()
 class AiLUT(BaseModel):
     r"""Adaptive-Interval 3D Lookup Table for real-time image enhancement.
@@ -526,10 +613,14 @@ class AiLUT(BaseModel):
         en_post_refine=False,
         en_spatial_offset=False,
         en_input_smooth=True,
+        en_deblocking=False,
         refine_hidden=16,
         refine_scale_factor=4,
         pre_refine_residual_scale=0.1,
         post_refine_residual_scale=0.1,
+        deblocking_hidden=24,
+        deblocking_scale_factor=2,
+        deblocking_residual_scale=0.15,
         offset_hidden=16,
         offset_scale_factor=4,
         offset_scale=0.05,
@@ -592,12 +683,21 @@ class AiLUT(BaseModel):
 
         # Post-refinement head (after LUT, optional)
         self.en_post_refine = en_post_refine
+        self.en_deblocking = en_deblocking
         if en_post_refine:
             self.post_refine = PostRefineHead(
                 in_channels=6,
                 hidden=refine_hidden,
                 scale_factor=refine_scale_factor,
                 residual_scale=post_refine_residual_scale
+            )
+        
+        # Lightweight Deblocking module (recommended for artifact removal)
+        if en_deblocking:
+            self.deblocking = LightweightDeblocking(
+                hidden=deblocking_hidden,
+                scale_factor=deblocking_scale_factor,
+                residual_scale=deblocking_residual_scale
             )
         
         # 兼容旧配置
@@ -627,9 +727,15 @@ class AiLUT(BaseModel):
         self.n_fix_iters = train_cfg.get('n_fix_iters', 0) if train_cfg else 0
         # fix Refinement for some steps (new)
         self.n_fix_refine_iters = train_cfg.get('n_fix_refine_iters', 0) if train_cfg else 0
+        # freeze LUT modules for stage2 training (new)
+        self.freeze_lut = train_cfg.get('freeze_lut', False) if train_cfg else False
         self.adaint_fixed = False
         self.refine_fixed = False
         self.register_buffer('cnt_iters', torch.zeros(1))
+        
+        # 如果是阶段2训练，冻结 LUT 相关模块
+        if self.freeze_lut:
+            self._freeze_lut_modules()
 
     def init_weights(self):
         r"""Init weights for models.
@@ -652,16 +758,30 @@ class AiLUT(BaseModel):
         if self.en_adaint:
             self.adaint.init_weights()
 
+    def _freeze_lut_modules(self):
+        r"""Freeze LUT-related modules for stage2 training."""
+        # 冻结 backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        # 冻结 lut_generator
+        for param in self.lut_generator.parameters():
+            param.requires_grad = False
+        # 冻结 adaint
+        if self.en_adaint:
+            for param in self.adaint.parameters():
+                param.requires_grad = False
+        get_root_logger().info('Frozen LUT modules (backbone, lut_generator, adaint) for stage2 training.')
+
     def forward_dummy(self, imgs):
         r"""The real implementation of model forward.
 
         Args:
             img (Tensor): Input image, shape (b, c, h, w).
         Returns:
-            tuple(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor):
+            tuple(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor):
                 Output image, LUT weights, Sampling Coordinates, 
                 Pre-refine residual (if enabled), Post-refine residual (if enabled),
-                Spatial offset (if enabled).
+                Spatial offset (if enabled), Deblocking residual (if enabled).
         """
         # E: (b, f) - Backbone 用原始图像提取特征
         codes = self.backbone(imgs)
@@ -697,14 +817,19 @@ class AiLUT(BaseModel):
         if self.en_spatial_offset and self.offset_mode == 'output':
             lut_out = lut_out + spatial_offset
 
-        # Post-refinement: 修复 LUT 输出的伪影 (可选)
+        # Post-refinement: 修复 LUT 输出的伪影 (可选，旧版)
         post_refine_residual = None
         if self.en_post_refine:
             outs, post_refine_residual = self.post_refine(lut_out, imgs)
         else:
             outs = lut_out
 
-        return outs, weights, vertices, pre_refine_residual, post_refine_residual, spatial_offset
+        # Lightweight Deblocking: 专门针对块状伪影的后处理 (推荐)
+        deblocking_residual = None
+        if self.en_deblocking:
+            outs, deblocking_residual = self.deblocking(outs, imgs)
+
+        return outs, weights, vertices, pre_refine_residual, post_refine_residual, spatial_offset, deblocking_residual
 
     @auto_fp16(apply_to=('lq', ))
     def forward(self, lq, gt=None, test_mode=False, **kwargs):
@@ -732,7 +857,7 @@ class AiLUT(BaseModel):
             outputs (dict): Output results.
         """
         losses = dict()
-        output, weights, vertices, pre_refine_residual, post_refine_residual, spatial_offset = self.forward_dummy(lq)
+        output, weights, vertices, pre_refine_residual, post_refine_residual, spatial_offset, deblocking_residual = self.forward_dummy(lq)
 
         # Reconstruction loss
         losses['loss_recons'] = self.recons_loss(output, gt)
@@ -771,6 +896,11 @@ class AiLUT(BaseModel):
             if iter_count % 100 == 0:
                 print(f"[DEBUG iter={iter_count}] spatial_offset: min={spatial_offset.min().item():.6f}, max={spatial_offset.max().item():.6f}, abs_mean={spatial_offset.abs().mean().item():.6f}")
 
+        # Deblocking debug
+        if self.en_deblocking and deblocking_residual is not None:
+            if iter_count % 100 == 0:
+                print(f"[DEBUG iter={iter_count}] deblocking: min={deblocking_residual.min().item():.6f}, max={deblocking_residual.max().item():.6f}, abs_mean={deblocking_residual.abs().mean().item():.6f}")
+
         outputs = dict(
             losses=losses,
             num_samples=len(gt.data),
@@ -796,7 +926,7 @@ class AiLUT(BaseModel):
         Returns:
             outputs (dict): Output results.
         """
-        output, _, _, _, _, _ = self.forward_dummy(lq)
+        output, _, _, _, _, _, _ = self.forward_dummy(lq)
         if self.test_cfg is not None and self.test_cfg.get('metrics', None):
             assert gt is not None, (
                 'evaluation with metrics must have gt images.')

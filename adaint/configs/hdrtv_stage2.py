@@ -1,10 +1,10 @@
-exp_name = 'ailut_hdrtv_deblocking_stage2'
+exp_name = 'ailut_hdrtv_stage2'
 
 custom_imports = dict(
     imports=['adaint'],
     allow_failed_imports=False)
 
-# model settings
+# model settings - 冻结 LUT，只训练 deblocking
 model = dict(
     type='AiLUT',
     n_ranks=5,
@@ -17,22 +17,16 @@ model = dict(
     sparse_factor=0.0001,
     smooth_factor=0.0,
     monotonicity_factor=10.0,
-    # === 关闭 spatial offset ===
+    # === 关闭其他模块 ===
     en_spatial_offset=False,
-    # === 关闭 pre/post refine ===
     en_pre_refine=False,
     en_post_refine=False,
-    # === 启用 Lightweight Deblocking ===
+    # === 启用 Deblocking ===
     en_deblocking=True,
     deblocking_hidden=24,
-    deblocking_scale_factor=1,         # 全分辨率，保留块边界细节
+    deblocking_scale_factor=1,         # 全分辨率
     deblocking_residual_scale=0.15,
-    # === 其他配置 ===
     en_input_smooth=False,
-    refine_hidden=16,
-    refine_scale_factor=4,
-    pre_refine_residual_scale=0.1,
-    post_refine_residual_scale=0.1,
     residual_reg_factor=0.0,
     recons_loss=dict(type='MSELoss', loss_weight=1.0, reduction='mean'))
 
@@ -40,8 +34,7 @@ model = dict(
 train_cfg = dict(
     n_fix_iters=0,
     n_fix_refine_iters=0,
-    # === 两阶段训练：冻结 LUT 相关模块 ===
-    freeze_lut=True,                   # 冻结 backbone + lut_generator + adaint
+    freeze_lut=True,                   # 冻结 LUT 相关模块
 )
 test_cfg = dict(metrics=['PSNR', 'SSIM'], crop_border=0)
 
@@ -98,7 +91,6 @@ data = dict(
     train_dataloader=dict(samples_per_gpu=16),
     val_dataloader=dict(samples_per_gpu=1),
     test_dataloader=dict(samples_per_gpu=1, workers_per_gpu=1),
-    # train
     train=dict(
         type=train_dataset_type,
         dir_lq='/home/sas/ke/dataset/train_sdr',
@@ -108,7 +100,6 @@ data = dict(
         test_mode=False,
         filetmpl_lq='{}.png',
         filetmpl_gt='{}.png'),
-    # val
     val=dict(
         type=val_dataset_type,
         dir_lq='/home/sas/ke/dataset/test_sdr',
@@ -118,7 +109,6 @@ data = dict(
         test_mode=True,
         filetmpl_lq='{}.png',
         filetmpl_gt='{}.png'),
-    # test
     test=dict(
         type=val_dataset_type,
         dir_lq='/home/sas/ke/dataset/test_sdr',
@@ -141,12 +131,11 @@ optimizers = dict(
         'backbone': dict(lr_mult=0.0),       # 冻结
         'lut_generator': dict(lr_mult=0.0),  # 冻结
         'adaint': dict(lr_mult=0.0),         # 冻结
-        'deblocking': dict(lr_mult=1.0),     # 只训练 deblocking
+        'deblocking': dict(lr_mult=1.0),
     }))
 lr_config = None
 
-# learning policy - 阶段2 训练较短
-total_iters = 77 * 200                 # 200 epoch 足够
+total_iters = 77 * 200                 # 200 epoch
 
 checkpoint_config = dict(interval=7700, save_optimizer=True, by_epoch=False)
 evaluation = dict(interval=770, save_image=True, save_best=True, key_indicator='PSNR')
@@ -157,13 +146,11 @@ log_config = dict(
     ])
 visual_config = None
 
-# runtime settings
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = f'./work_dirs/{exp_name}'
-# === 加载阶段1训练好的 LUT 模型 ===
-# 请修改为你的阶段1最佳模型路径
-load_from = './work_dirs/ailut_hdrtv/best_PSNR.pth'
+# 加载阶段1训练好的模型
+load_from = './work_dirs/ailut_hdrtv_stage1/best_PSNR.pth'
 resume_from = None
 workflow = [('train', 1)]
 find_unused_parameters = True
